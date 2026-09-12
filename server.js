@@ -1,197 +1,456 @@
 import http from "node:http";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { randomBytes } from "node:crypto";
+import { mkdir, readFile, writeFile, rename } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, extname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const dbPath = join(__dirname, "data", "core-slices.json");
-const port = Number(process.env.PORT || 3025);
-const statuses = ["待切割", "制片中", "待观察", "已交付"];
-const taskSteps = ["取样", "切割", "研磨", "染色", "观察"];
 
-const seed = {
-  samples: [
-    {
-      id: "CORE-001",
+// 项目规定的五道制片工序，必须依次推进；五序完成后进入“待观察”
+const STAGES = ["取样", "切割", "研磨", "染色", "封片"];
+const STAGE_COUNT = STAGES.length;
+
+// 数据与静态资源
+const dbPath = process.env.DB_FILE
+  ? (process.env.DB_FILE.startsWith("/") ? process.env.DB_FILE : join(__dirname, process.env.DB_FILE))
+  : join(__dirname, "data", "core-slices.json");
+const publicDir = join(__dirname, "public");
+const port = Number(process.env.PORT || 3025);
+
+/* ---------------- 领域工具 ---------------- */
+
+function newSlice(code, operator, basis = "登记时建立任务") {
+  return {
+    code,
+    operator,                 // 当前负责人（下一序的默认操作人）
+    stageIndex: 0,            // 下一道待执行工序下标；STAGE_COUNT 表示五序已完成
+    phase: "producing",       // producing | observing | rejected | qualified
+    observations: [],         // 观察记录：{conclusion, defect, reason, operator, basis, at}
+    // 五道工序占位记录，按工序下标排列；推进时补齐操作人/依据/时间
+    records: STAGES.map(stage => ({ stage, operator: null, basis: null, at: null })),
+    idempotencyKeys: {},      // 本切片已成功消费的幂等键（重放时只成功一次的那次）
+    replacementFor: null,     // 若是替代切片：被替代切片编码
+    replacedBy: null,         // 若已作废：替代切片编码
+    voided: false,
+    voidReason: null,
+    voidedAt: null
+  };
+}
+
+function seedDb() {
+  const now = new Date().toISOString();
+  const mk = (code, op, idx, overrides = {}) => {
+    const s = newSlice(code, op);
+    s.stageIndex = idx;
+    for (let i = 0; i < idx; i++) s.records[i] = { stage: STAGES[i], operator: op, basis: `示范：${STAGES[i]}工序依据`, at: now };
+    return Object.assign(s, overrides);
+  };
+  const a = mk("SL-DEMO-A1", "陆川", STAGE_COUNT);
+  a.phase = "qualified";
+  a.observations.push({ conclusion: "合格", defect: "", reason: "", operator: "周岩", basis: "镜下观察：矿物结构完整，无明显裂隙", at: now });
+  const b = mk("SL-DEMO-A2", "陆川", 3); // 染色中
+  const c = mk("SL-DEMO-A3", "周岩", STAGE_COUNT, {
+    phase: "rejected",
+    voided: true,
+    voidReason: "染色不均且边缘破碎，无法判读",
+    voidedAt: now,
+    observations: [{ conclusion: "不合格", defect: "染色不均/边缘破碎", reason: "研磨粒度超标导致盖片不密合", operator: "周岩", basis: "镜下观察记录 OBS-0091", at: now }]
+  });
+  const r = mk("SL-DEMO-A3-R1", "韩冰", 1, { replacementFor: "SL-DEMO-A3" });
+  c.replacedBy = "SL-DEMO-A3-R1";
+  return {
+    version: 2,
+    seq: 2,
+    batches: [{
+      id: "B20260912-001",
       project: "东岭铜矿薄片",
       borehole: "ZK-17",
       coreBox: "BX-09",
       depth: "128.4-128.8m",
       owner: "陆川",
-      status: "制片中",
-      delivery: "未交付",
-      slices: [
-        { id: "SL-001-A", method: "茜素红染色", observation: "", status: "研磨", logs: [{ at: "2026-06-12T10:00:00.000Z", step: "取样", note: "截取含矿化条带位置" }, { at: "2026-06-13T11:20:00.000Z", step: "切割", note: "完成粗切" }] }
-      ]
-    }
-  ]
-};
+      createdAt: now,
+      deliveredAt: null,
+      slices: [a, b, c, r]
+    }]
+  };
+}
 
-async function loadDb() {
-  if (!existsSync(dbPath)) {
-    await mkdir(dirname(dbPath), { recursive: true });
-    await writeFile(dbPath, JSON.stringify(seed, null, 2));
+function nextBatchId(db, now = new Date()) {
+  const day = now.toISOString().slice(0, 10).replace(/-/g, "");
+  const seq = (db.seq = (db.seq || 0) + 1);
+  return `B${day}-${String(seq).padStart(3, "0")}`;
+}
+
+function sliceNextAction(slice) {
+  if (slice.voided) return { kind: "void", label: "已作废" };
+  if (slice.phase === "qualified") return { kind: "done", label: "已判合格" };
+  if (slice.phase === "rejected") return { kind: "await-replacement", label: "待补替代切片" };
+  if (slice.stageIndex >= STAGE_COUNT) return { kind: "observe", label: "待观察" };
+  return { kind: "advance", label: `待${STAGES[slice.stageIndex]}`, stage: STAGES[slice.stageIndex], stageIndex: slice.stageIndex };
+}
+
+function sliceView(slice) {
+  const action = sliceNextAction(slice);
+  return {
+    code: slice.code,
+    operator: slice.operator,
+    stageIndex: slice.stageIndex,
+    stageName: slice.stageIndex >= STAGE_COUNT ? "待观察" : STAGES[slice.stageIndex],
+    phase: slice.phase,
+    voided: slice.voided,
+    voidReason: slice.voidReason,
+    voidedAt: slice.voidedAt,
+    replacementFor: slice.replacementFor,
+    replacedBy: slice.replacedBy,
+    records: slice.records,
+    observations: slice.observations,
+    nextAction: action
+  };
+}
+
+// 批次能否交付：不存在未观察、不合格未闭环（未补替代）的切片；
+// 已作废切片必须有替代链且替代切片合格。
+function readiness(batch) {
+  const blockers = [];
+  const active = batch.slices.filter(s => !s.voided);
+  const producing = active.filter(s => s.phase === "producing");
+  const unobserved = active.filter(s => s.phase === "observing");
+  const rejected = active.filter(s => s.phase === "rejected");
+
+  if (producing.length) blockers.push({ code: "in_production", message: `${producing.length} 张切片仍在五道工序中（未观察）`, slices: producing.map(s => s.code) });
+  if (unobserved.length) blockers.push({ code: "unobserved", message: `${unobserved.length} 张切片已完成制片尚未观察`, slices: unobserved.map(s => s.code) });
+  if (rejected.length) blockers.push({ code: "missing_replacement", message: `${rejected.length} 张不合格切片尚未登记替代切片`, slices: rejected.map(s => s.code) });
+
+  for (const s of batch.slices.filter(x => x.voided)) {
+    if (!s.replacedBy) blockers.push({ code: "missing_replacement", message: `作废切片 ${s.code} 未补替代切片`, slices: [s.code] });
+    else {
+      const rep = batch.slices.find(x => x.code === s.replacedBy);
+      if (!rep || rep.voided || rep.phase !== "qualified") {
+        blockers.push({ code: "replacement_open", message: `作废切片 ${s.code} 的替代切片 ${s.replacedBy} 尚未合格`, slices: [s.replacedBy] });
+      }
+    }
   }
-  return JSON.parse(await readFile(dbPath, "utf8"));
+  return { canDeliver: blockers.length === 0, blockers };
 }
-async function saveDb(db) { await writeFile(dbPath, JSON.stringify(db, null, 2)); }
-async function body(req) {
-  const chunks = [];
-  for await (const chunk of req) chunks.push(chunk);
-  return chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : {};
+
+function batchView(batch) {
+  const slices = batch.slices.map(sliceView);
+  const r = readiness(batch);
+  // 缺陷是否闭环：已登记替代片且替代片已判合格
+  const isClosedDefect = s => {
+    if (!s.voided) return false;
+    const rep = s.replacedBy && batch.slices.find(x => x.code === s.replacedBy);
+    return Boolean(rep && !rep.voided && rep.phase === "qualified");
+  };
+  const openDefects = batch.slices.filter(s => s.voided && !isClosedDefect(s));
+  const counts = {
+    total: batch.slices.length,
+    producing: batch.slices.filter(s => !s.voided && s.phase === "producing").length,
+    observing: batch.slices.filter(s => !s.voided && s.phase === "observing").length,
+    rejected: openDefects.length,
+    voided: batch.slices.filter(s => s.voided).length,
+    qualified: batch.slices.filter(s => !s.voided && s.phase === "qualified").length
+  };
+  // 下一负责人：按当前待处理动作聚合
+  const nextOwners = {};
+  for (const s of slices) {
+    if (["advance", "observe", "await-replacement"].includes(s.nextAction.kind)) {
+      const key = `${s.operator}|${s.nextAction.label}`;
+      (nextOwners[key] ||= { operator: s.operator, action: s.nextAction.label, slices: [] }).slices.push(s.code);
+    }
+  }
+  const pendingDefects = openDefects.map(s => {
+      const obs = s.observations.filter(o => o.conclusion === "不合格").at(-1);
+      return {
+        sliceCode: s.code, defect: obs?.defect || "", reason: s.voidReason || obs?.reason || "",
+        replacedBy: s.replacedBy,
+        replacementStatus: s.replacedBy ? sliceView(batch.slices.find(x => x.code === s.replacedBy)).nextAction.label : "未登记"
+      };
+    });
+  const doneSteps = batch.slices.reduce((n, s) => n + s.records.filter(rec => rec.at).length, 0);
+  const totalSteps = batch.slices.length * STAGE_COUNT;
+  return {
+    id: batch.id, project: batch.project, borehole: batch.borehole, coreBox: batch.coreBox,
+    depth: batch.depth, owner: batch.owner, createdAt: batch.createdAt,
+    delivered: Boolean(batch.deliveredAt), deliveredAt: batch.deliveredAt,
+    counts, progress: { doneSteps, totalSteps, percent: totalSteps ? Math.round(doneSteps / totalSteps * 100) : 0 },
+    slices, nextOwners: Object.values(nextOwners), pendingDefects, readiness: r
+  };
 }
+
+/* ---------------- 持久化（读-改-写全程串行，原子落盘，重启保留） ---------------- */
+
+let db = null;
+let chain = Promise.resolve();
+
+async function initDb() {
+  if (existsSync(dbPath)) {
+    const raw = JSON.parse(await readFile(dbPath, "utf8"));
+    if (raw.version === 2) { db = raw; return; }
+    // v1 脚手架数据：备份后重建，避免语义不一致
+    await rename(dbPath, dbPath.replace(/\.json$/, `.v1-${Date.now()}.bak.json`));
+  }
+  db = seedDb();
+  await persist();
+}
+
+async function persist() {
+  await mkdir(dirname(dbPath), { recursive: true });
+  const tmp = `${dbPath}.tmp-${process.pid}-${randomBytes(4).toString("hex")}`;
+  await writeFile(tmp, JSON.stringify(db, null, 2));
+  await rename(tmp, dbPath);
+}
+
+// 所有写操作经同一互斥链串行化；重复/过期并发请求只有一个能看到可推进状态
+function withLock(fn) {
+  const run = chain.then(() => fn(db));
+  chain = run.then(() => {}, () => {});
+  return run;
+}
+
+/* ---------------- HTTP 辅助 ---------------- */
+
 function sendJson(res, status, data) {
   res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
   res.end(JSON.stringify(data, null, 2));
 }
-function updateSampleStatus(sample) {
-  const sliceStatuses = sample.slices.map(slice => slice.status);
-  if (sliceStatuses.length && sliceStatuses.every(step => step === "观察")) sample.status = "待观察";
-  if (sample.delivery === "已交付") sample.status = "已交付";
-  else if (sliceStatuses.some(step => ["取样", "切割", "研磨", "染色"].includes(step))) sample.status = "制片中";
-  else sample.status = "待切割";
+function fail(res, status, code, message, extra = {}) {
+  return sendJson(res, status, { error: code, message, ...extra });
+}
+async function readBody(req) {
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  if (!chunks.length) return {};
+  try { return JSON.parse(Buffer.concat(chunks).toString("utf8")); }
+  catch { throw Object.assign(new Error("请求体不是合法 JSON"), { http: 400, code: "bad_json" }); }
+}
+function requireStr(input, key, code) {
+  const v = (input[key] ?? "").toString().trim();
+  if (!v) throw Object.assign(new Error(`${key} 不能为空`), { http: 400, code: code || "invalid_input" });
+  return v;
 }
 
-const page = `<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>岩芯样本切片实验室</title>
-  <style>
-    :root { --bg:#f1f3ef; --panel:#fff; --ink:#242822; --muted:#687062; --line:#d7ddd1; --accent:#526f43; --stone:#73706a; }
-    * { box-sizing:border-box; } body { margin:0; background:var(--bg); color:var(--ink); font-family:Arial,"PingFang SC",sans-serif; }
-    header { padding:22px 28px; background:#fff; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; align-items:center; gap:16px; }
-    h1 { margin:0; font-size:26px; } main { display:grid; grid-template-columns:390px 1fr; gap:22px; padding:22px 28px; }
-    form,.panel,.card,.stat { background:#fff; border:1px solid var(--line); border-radius:8px; padding:16px; } h2 { margin:0 0 12px; font-size:18px; }
-    label { display:block; margin:10px 0 5px; color:var(--muted); font-size:13px; } input,select,textarea { width:100%; border:1px solid var(--line); border-radius:6px; padding:9px; font:inherit; background:#fff; } textarea { min-height:68px; }
-    button { border:0; border-radius:6px; background:var(--accent); color:#fff; padding:10px 13px; font-weight:700; cursor:pointer; }
-    .stats { display:grid; grid-template-columns:repeat(4,1fr); gap:10px; margin-bottom:14px; } .stat strong { display:block; font-size:24px; }
-    .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(310px,1fr)); gap:12px; } .card { display:grid; gap:8px; }
-    .meta { color:var(--muted); font-size:13px; } .pill { display:inline-block; border:1px solid var(--line); border-radius:999px; padding:3px 8px; font-size:12px; }
-    .slice { border-top:1px solid var(--line); padding-top:10px; } .toolbar { display:flex; gap:10px; flex-wrap:wrap; margin-bottom:14px; }
-    @media (max-width:950px){ header{display:block;padding:18px 16px;} main{grid-template-columns:1fr;padding:16px;} .stats{grid-template-columns:1fr 1fr;} }
-  </style>
-</head>
-<body>
-  <header><div><h1>岩芯样本切片实验室</h1><div class="meta">样本、切片任务、制片步骤和交付</div></div><button id="reload">刷新</button></header>
-  <main>
-    <form id="form">
-      <h2>创建岩芯样本</h2>
-      <label>项目</label><input name="project" required>
-      <label>钻孔编号</label><input name="borehole" required>
-      <label>岩芯箱号</label><input name="coreBox" required>
-      <label>取样深度</label><input name="depth" required>
-      <label>负责人</label><input name="owner" required>
-      <label>初始切片编号</label><input name="sliceId" required>
-      <label>染色方法</label><input name="method" required>
-      <button>保存样本</button>
-    </form>
-    <section>
-      <div class="stats" id="stats"></div>
-      <div class="grid" id="samples"></div>
-    </section>
-  </main>
-  <script>
-    const statuses = ${JSON.stringify(statuses)};
-    const steps = ${JSON.stringify(taskSteps)};
-    const form = document.querySelector("#form");
-    const stats = document.querySelector("#stats");
-    const samplesEl = document.querySelector("#samples");
-    let samples = [];
-    async function api(path, options) {
-      const res = await fetch(path, options && options.body ? { ...options, headers:{ "Content-Type":"application/json" } } : options);
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "请求失败");
-      return data;
+/* ---------------- 路由处理（均在锁内执行检查与落盘） ---------------- */
+
+function createBatch(input) {
+  const project = requireStr(input, "project");
+  const borehole = requireStr(input, "borehole");
+  const coreBox = requireStr(input, "coreBox");
+  const depth = requireStr(input, "depth");
+  const owner = requireStr(input, "owner");
+  const list = Array.isArray(input.slices) ? input.slices : [];
+  if (!list.length) throw Object.assign(new Error("一次登记至少需要一张切片"), { http: 400, code: "no_slices" });
+
+  const slices = [];
+  const codes = new Set();
+  for (const item of list) {
+    const code = requireStr(item, "code", "slice_code_required");
+    if (codes.has(code)) throw Object.assign(new Error(`同批次切片编号重复：${code}`), { http: 400, code: "duplicate_slice_code" });
+    codes.add(code);
+    const op = (item.operator || "").toString().trim() || owner;
+    slices.push(newSlice(code, op, (item.basis || "").toString().trim() || "登记时建立任务"));
+  }
+  const batch = {
+    id: nextBatchId(db), project, borehole, coreBox, depth, owner,
+    createdAt: new Date().toISOString(), deliveredAt: null, slices
+  };
+  db.batches.unshift(batch);
+  return persist().then(() => batchView(batch));
+}
+
+function advanceSlice(batchId, sliceCode, input) {
+  const batch = db.batches.find(b => b.id === batchId);
+  if (!batch) throw Object.assign(new Error("批次不存在"), { http: 404, code: "batch_not_found" });
+  const slice = batch.slices.find(s => s.code === sliceCode);
+  if (!slice) throw Object.assign(new Error("切片不存在"), { http: 404, code: "slice_not_found" });
+
+  if (slice.voided) throw Object.assign(new Error("切片已作废，不能推进"), { http: 409, code: "slice_voided" });
+  if (slice.phase === "rejected") throw Object.assign(new Error("切片已判不合格并作废，等待替代切片"), { http: 409, code: "slice_rejected" });
+  if (slice.phase === "qualified") throw Object.assign(new Error("切片已判合格，无需再推进"), { http: 409, code: "already_qualified" });
+
+  // 幂等键优先：同一推进请求（即使带的是旧 expectedStage）重放，算重复而非过期；
+  // 此前已成功一次，本次失败且状态/记录不变
+  const reqId = (input.reqId || "").toString().trim();
+  if (reqId && Object.prototype.hasOwnProperty.call(slice.idempotencyKeys, reqId)) {
+    throw Object.assign(
+      new Error(`重复推进请求（${reqId}）此前已成功一次，本次失败且状态与记录不变`),
+      { http: 409, code: "duplicate_request", duplicateOf: slice.idempotencyKeys[reqId] }
+    );
+  }
+
+  // 过期请求：携带的期望工序与当前工序不一致（含重复提交同一工序、五序完成后的迟到推进）
+  const expectedRaw = input.expectedStage;
+  if (expectedRaw !== undefined && expectedRaw !== null && expectedRaw !== "") {
+    const expected = Number(expectedRaw);
+    if (Number.isInteger(expected) && expected !== slice.stageIndex) {
+      const curName = slice.stageIndex >= STAGE_COUNT ? "待观察" : STAGES[slice.stageIndex];
+      throw Object.assign(
+        new Error(`过期/重复推进：请求针对「${STAGES[expected] ?? `#${expected}`}」，当前已是「${curName}」，状态与记录不变`),
+        { http: 409, code: "stale_advance", currentStageIndex: slice.stageIndex, currentStage: curName }
+      );
     }
-    function render() {
-      stats.innerHTML = statuses.map(s => '<div class="stat"><span>'+s+'</span><strong>'+samples.filter(item => item.status === s).length+'</strong></div>').join("");
-      samplesEl.innerHTML = samples.map(sample => '<article class="card"><h3>'+sample.project+'</h3><span class="pill">'+sample.status+'</span><div class="meta">'+sample.borehole+' · '+sample.coreBox+' · '+sample.depth+' · '+sample.owner+'</div><label>新增切片</label><input data-new-slice="'+sample.id+'" placeholder="切片编号"><input data-method="'+sample.id+'" placeholder="染色方法"><button data-add="'+sample.id+'">添加切片</button>'+sample.slices.map(slice => '<div class="slice"><b>'+slice.id+'</b><div class="meta">'+slice.method+' · 当前步骤 '+slice.status+'</div><select data-step="'+sample.id+'|'+slice.id+'">'+steps.map(step => '<option>'+step+'</option>').join("")+'</select><textarea data-note="'+sample.id+'|'+slice.id+'" placeholder="步骤备注或观察结果"></textarea><button data-log="'+sample.id+'|'+slice.id+'">记录步骤</button><div class="meta">'+slice.logs.map(log => log.step+"："+log.note).join(" / ")+'</div></div>').join("")+'<button data-deliver="'+sample.id+'">标记交付</button></article>').join("");
-      document.querySelectorAll("[data-step]").forEach(sel => {
-        const [sampleId, sliceId] = sel.dataset.step.split("|");
-        const slice = samples.find(s => s.id === sampleId).slices.find(s => s.id === sliceId);
-        sel.value = slice.status;
-      });
-      document.querySelectorAll("[data-add]").forEach(btn => btn.onclick = async () => {
-        const id = btn.dataset.add;
-        await api('/api/samples/'+id+'/slices', { method:'POST', body: JSON.stringify({ id: document.querySelector('[data-new-slice="'+id+'"]').value, method: document.querySelector('[data-method="'+id+'"]').value || "未指定" }) });
-        await load();
-      });
-      document.querySelectorAll("[data-log]").forEach(btn => btn.onclick = async () => {
-        const [sampleId, sliceId] = btn.dataset.log.split("|");
-        await api('/api/samples/'+sampleId+'/slices/'+sliceId+'/logs', { method:'POST', body: JSON.stringify({ step: document.querySelector('[data-step="'+sampleId+'|'+sliceId+'"]').value, note: document.querySelector('[data-note="'+sampleId+'|'+sliceId+'"]').value || "步骤完成" }) });
-        await load();
-      });
-      document.querySelectorAll("[data-deliver]").forEach(btn => btn.onclick = async () => { await api('/api/samples/'+btn.dataset.deliver+'/deliver', { method:'POST', body: JSON.stringify({}) }); await load(); });
-    }
-    async function load(){ samples = await api("/api/samples"); render(); }
-    document.querySelector("#reload").onclick = load;
-    form.onsubmit = async event => {
-      event.preventDefault();
-      await api("/api/samples", { method:"POST", body: JSON.stringify(Object.fromEntries(new FormData(form).entries())) });
-      form.reset(); await load();
-    };
-    load();
-  </script>
-</body>
-</html>`;
+  }
+
+  if (slice.stageIndex >= STAGE_COUNT) throw Object.assign(new Error("五道工序已完成，该切片待观察而非继续推进"), { http: 409, code: "awaiting_observation" });
+
+  const operator = requireStr(input, "operator");
+  const basis = requireStr(input, "basis");
+  const idx = slice.stageIndex;
+  const at = new Date().toISOString();
+  slice.records[idx] = { stage: STAGES[idx], operator, basis, at };
+  slice.stageIndex = idx + 1;
+  if (slice.stageIndex >= STAGE_COUNT) slice.phase = "observing";
+  slice.operator = (input.nextOperator || "").toString().trim() || operator;
+  if (reqId) slice.idempotencyKeys[reqId] = { stageIndex: idx, at };
+
+  return persist().then(() => batchView(batch));
+}
+
+function observeSlice(batchId, sliceCode, input) {
+  const batch = db.batches.find(b => b.id === batchId);
+  if (!batch) throw Object.assign(new Error("批次不存在"), { http: 404, code: "batch_not_found" });
+  const slice = batch.slices.find(s => s.code === sliceCode);
+  if (!slice) throw Object.assign(new Error("切片不存在"), { http: 404, code: "slice_not_found" });
+  if (slice.voided) throw Object.assign(new Error("切片已作废"), { http: 409, code: "slice_voided" });
+  if (slice.phase === "qualified") throw Object.assign(new Error("切片已判合格"), { http: 409, code: "already_qualified" });
+  if (slice.phase === "rejected") throw Object.assign(new Error("切片已判不合格并作废"), { http: 409, code: "already_rejected" });
+  if (slice.stageIndex < STAGE_COUNT) {
+    throw Object.assign(new Error(`五道工序尚未完成（当前 ${STAGES[slice.stageIndex]}），不能观察下结论`), {
+      http: 409, code: "stages_incomplete", currentStageIndex: slice.stageIndex
+    });
+  }
+  const conclusion = requireStr(input, "conclusion");
+  if (!["合格", "不合格"].includes(conclusion)) throw Object.assign(new Error("结论只能是 合格 或 不合格"), { http: 400, code: "bad_conclusion" });
+  const operator = requireStr(input, "operator");
+  const basis = requireStr(input, "basis");
+
+  const rec = { conclusion, defect: "", reason: "", operator, basis, at: new Date().toISOString() };
+  if (conclusion === "不合格") {
+    rec.defect = requireStr(input, "defect");
+    rec.reason = requireStr(input, "reason"); // 作废原因
+    slice.phase = "rejected";
+    slice.voided = true;
+    slice.voidReason = rec.reason;
+    slice.voidedAt = rec.at;
+    const replacementCode = (input.replacementCode || "").toString().trim();
+    if (replacementCode) registerReplacement(batch, slice, replacementCode, (input.replacementOperator || "").toString().trim() || batch.owner);
+  } else {
+    slice.phase = "qualified";
+  }
+  slice.observations.push(rec);
+  return persist().then(() => batchView(batch));
+}
+
+// 在批次内为不合格切片登记替代切片；替代切片从第一道工序重新开始
+function registerReplacement(batch, rejected, code, operator) {
+  if (batch.slices.some(s => s.code === code)) throw Object.assign(new Error(`切片编号已存在：${code}`), { http: 409, code: "duplicate_slice_code" });
+  const rep = newSlice(code, operator, `替代作废切片 ${rejected.code}，从第一道工序重做`);
+  rep.replacementFor = rejected.code;
+  batch.slices.push(rep);
+  rejected.replacedBy = code;
+  rejected.phase = "rejected"; // 保持不合格闭环状态
+  return rep;
+}
+
+function addReplacement(batchId, sliceCode, input) {
+  const batch = db.batches.find(b => b.id === batchId);
+  if (!batch) throw Object.assign(new Error("批次不存在"), { http: 404, code: "batch_not_found" });
+  const slice = batch.slices.find(s => s.code === sliceCode);
+  if (!slice) throw Object.assign(new Error("切片不存在"), { http: 404, code: "slice_not_found" });
+  if (!slice.voided || slice.phase !== "rejected") throw Object.assign(new Error("只有不合格且已作废的切片需要补替代切片"), { http: 409, code: "not_rejected" });
+  if (slice.replacedBy) throw Object.assign(new Error(`该切片已登记替代切片 ${slice.replacedBy}`), { http: 409, code: "replacement_exists" });
+  const code = requireStr(input, "replacementCode");
+  const operator = (input.operator || "").toString().trim() || batch.owner;
+  registerReplacement(batch, slice, code, operator);
+  return persist().then(() => batchView(batch));
+}
+
+function deliverBatch(batchId) {
+  const batch = db.batches.find(b => b.id === batchId);
+  if (!batch) throw Object.assign(new Error("批次不存在"), { http: 404, code: "batch_not_found" });
+  if (batch.deliveredAt) throw Object.assign(new Error("批次已交付，不能重复交付"), { http: 409, code: "already_delivered" });
+  const r = readiness(batch);
+  if (!r.canDeliver) {
+    throw Object.assign(new Error("批次尚不满足交付条件"), { http: 409, code: "not_deliverable", blockers: r.blockers });
+  }
+  batch.deliveredAt = new Date().toISOString();
+  return persist().then(() => batchView(batch));
+}
+
+/* ---------------- 静态页面 ---------------- */
+
+const mime = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml" };
+async function serveStatic(res, pathname) {
+  const rel = pathname === "/" ? "index.html" : pathname.replace(/^\/+/, "");
+  const file = join(publicDir, rel);
+  if (!file.startsWith(publicDir) || !existsSync(file)) { res.writeHead(404); return res.end("not found"); }
+  res.writeHead(200, { "Content-Type": mime[extname(file)] || "application/octet-stream" });
+  res.end(await readFile(file));
+}
+
+/* ---------------- 服务 ---------------- */
 
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
-    const db = await loadDb();
-    if (req.method === "GET" && url.pathname === "/") {
-      res.writeHead(200, { "Content-Type":"text/html; charset=utf-8" });
-      return res.end(page);
+    const p = url.pathname;
+
+    if (req.method === "GET" && p === "/") return await serveStatic(res, p);
+    if (req.method === "GET" && p === "/api/config") return sendJson(res, 200, { stages: STAGES, stageCount: STAGE_COUNT });
+
+    if (req.method === "GET" && p === "/api/batches") {
+      const view = db.batches.map(batchView);
+      const summary = {
+        batches: view.length,
+        slices: view.reduce((n, b) => n + b.counts.total, 0),
+        producing: view.reduce((n, b) => n + b.counts.producing, 0),
+        observing: view.reduce((n, b) => n + b.counts.observing, 0),
+        pendingDefects: view.reduce((n, b) => n + b.pendingDefects.length, 0),
+        deliverable: view.filter(b => b.readiness.canDeliver && !b.delivered).length,
+        delivered: view.filter(b => b.delivered).length
+      };
+      return sendJson(res, 200, { stages: STAGES, summary, batches: view });
     }
-    if (req.method === "GET" && url.pathname === "/api/samples") return sendJson(res, 200, db.samples);
-    if (req.method === "POST" && url.pathname === "/api/samples") {
-      const input = await body(req);
-      const sample = { id: `CORE-${Date.now()}`, project: input.project, borehole: input.borehole, coreBox: input.coreBox, depth: input.depth, owner: input.owner, status: "待切割", delivery: "未交付", slices: [{ id: input.sliceId, method: input.method, observation: "", status: "取样", logs: [{ at: new Date().toISOString(), step: "取样", note: "创建初始切片任务" }] }] };
-      updateSampleStatus(sample);
-      db.samples.unshift(sample);
-      await saveDb(db);
-      return sendJson(res, 201, sample);
+
+    if (req.method === "POST" && p === "/api/batches") {
+      const input = await readBody(req);
+      const view = await withLock(() => createBatch(input));
+      return sendJson(res, 201, view);
     }
-    const addSlice = url.pathname.match(/^\/api\/samples\/([^/]+)\/slices$/);
-    if (addSlice && req.method === "POST") {
-      const sample = db.samples.find(item => item.id === addSlice[1]);
-      if (!sample) return sendJson(res, 404, { error: "sample_not_found" });
-      const input = await body(req);
-      sample.slices.push({ id: input.id, method: input.method || "未指定", observation: "", status: "取样", logs: [{ at: new Date().toISOString(), step: "取样", note: "新增切片任务" }] });
-      updateSampleStatus(sample);
-      await saveDb(db);
-      return sendJson(res, 201, sample);
+
+    const advance = p.match(/^\/api\/batches\/([^/]+)\/slices\/([^/]+)\/advance$/);
+    if (advance && req.method === "POST") {
+      const input = await readBody(req);
+      const view = await withLock(() => advanceSlice(decodeURIComponent(advance[1]), decodeURIComponent(advance[2]), input));
+      return sendJson(res, 200, view);
     }
-    const logMatch = url.pathname.match(/^\/api\/samples\/([^/]+)\/slices\/([^/]+)\/logs$/);
-    if (logMatch && req.method === "POST") {
-      const sample = db.samples.find(item => item.id === logMatch[1]);
-      if (!sample) return sendJson(res, 404, { error: "sample_not_found" });
-      const slice = sample.slices.find(item => item.id === logMatch[2]);
-      if (!slice) return sendJson(res, 404, { error: "slice_not_found" });
-      const input = await body(req);
-      slice.status = input.step;
-      if (input.step === "观察") slice.observation = input.note || slice.observation;
-      slice.logs.push({ at: new Date().toISOString(), step: input.step, note: input.note || "" });
-      updateSampleStatus(sample);
-      await saveDb(db);
-      return sendJson(res, 200, sample);
+    const observe = p.match(/^\/api\/batches\/([^/]+)\/slices\/([^/]+)\/observe$/);
+    if (observe && req.method === "POST") {
+      const input = await readBody(req);
+      const view = await withLock(() => observeSlice(decodeURIComponent(observe[1]), decodeURIComponent(observe[2]), input));
+      return sendJson(res, 200, view);
     }
-    const deliverMatch = url.pathname.match(/^\/api\/samples\/([^/]+)\/deliver$/);
-    if (deliverMatch && req.method === "POST") {
-      const sample = db.samples.find(item => item.id === deliverMatch[1]);
-      if (!sample) return sendJson(res, 404, { error: "sample_not_found" });
-      sample.delivery = "已交付";
-      updateSampleStatus(sample);
-      await saveDb(db);
-      return sendJson(res, 200, sample);
+    const replacement = p.match(/^\/api\/batches\/([^/]+)\/slices\/([^/]+)\/replacement$/);
+    if (replacement && req.method === "POST") {
+      const input = await readBody(req);
+      const view = await withLock(() => addReplacement(decodeURIComponent(replacement[1]), decodeURIComponent(replacement[2]), input));
+      return sendJson(res, 201, view);
     }
-    sendJson(res, 404, { error: "not_found" });
+    const deliver = p.match(/^\/api\/batches\/([^/]+)\/deliver$/);
+    if (deliver && req.method === "POST") {
+      await readBody(req);
+      const view = await withLock(() => deliverBatch(decodeURIComponent(deliver[1])));
+      return sendJson(res, 200, view);
+    }
+
+    sendJson(res, 404, { error: "not_found", message: "接口或页面不存在" });
   } catch (error) {
-    sendJson(res, 500, { error: error.message });
+    const status = error.http || 500;
+    sendJson(res, status, { error: error.code || "server_error", message: error.message, ...(error.currentStageIndex !== undefined ? { currentStageIndex: error.currentStageIndex, currentStage: error.currentStage } : {}), ...(error.blockers ? { blockers: error.blockers } : {}), ...(error.duplicateOf ? { duplicateOf: error.duplicateOf } : {}) });
   }
 });
 
-server.listen(port, () => console.log(`Core slice lab app listening on http://localhost:${port}`));
+initDb().then(() => {
+  server.listen(port, () => console.log(`岩芯切片任务台已启动：http://localhost:${port}（数据文件 ${dbPath}）`));
+});

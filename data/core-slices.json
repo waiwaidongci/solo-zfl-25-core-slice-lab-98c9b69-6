@@ -1,32 +1,214 @@
 {
-  "samples": [
+  "version": 2,
+  "seq": 2,
+  "batches": [
     {
-      "id": "CORE-001",
+      "id": "B20260912-001",
       "project": "东岭铜矿薄片",
       "borehole": "ZK-17",
       "coreBox": "BX-09",
       "depth": "128.4-128.8m",
       "owner": "陆川",
-      "status": "制片中",
-      "delivery": "未交付",
+      "createdAt": "2026-09-12T19:15:06.285Z",
+      "deliveredAt": null,
       "slices": [
         {
-          "id": "SL-001-A",
-          "method": "茜素红染色",
-          "observation": "",
-          "status": "研磨",
-          "logs": [
+          "code": "SL-DEMO-A1",
+          "operator": "陆川",
+          "stageIndex": 5,
+          "phase": "qualified",
+          "observations": [
             {
-              "at": "2026-06-12T10:00:00.000Z",
-              "step": "取样",
-              "note": "截取含矿化条带位置"
+              "conclusion": "合格",
+              "defect": "",
+              "reason": "",
+              "operator": "周岩",
+              "basis": "镜下观察：矿物结构完整，无明显裂隙",
+              "at": "2026-09-12T19:15:06.285Z"
+            }
+          ],
+          "records": [
+            {
+              "stage": "取样",
+              "operator": "陆川",
+              "basis": "示范：取样工序依据",
+              "at": "2026-09-12T19:15:06.285Z"
             },
             {
-              "at": "2026-06-13T11:20:00.000Z",
-              "step": "切割",
-              "note": "完成粗切"
+              "stage": "切割",
+              "operator": "陆川",
+              "basis": "示范：切割工序依据",
+              "at": "2026-09-12T19:15:06.285Z"
+            },
+            {
+              "stage": "研磨",
+              "operator": "陆川",
+              "basis": "示范：研磨工序依据",
+              "at": "2026-09-12T19:15:06.285Z"
+            },
+            {
+              "stage": "染色",
+              "operator": "陆川",
+              "basis": "示范：染色工序依据",
+              "at": "2026-09-12T19:15:06.285Z"
+            },
+            {
+              "stage": "封片",
+              "operator": "陆川",
+              "basis": "示范：封片工序依据",
+              "at": "2026-09-12T19:15:06.285Z"
             }
-          ]
+          ],
+          "idempotencyKeys": {},
+          "replacementFor": null,
+          "replacedBy": null,
+          "voided": false,
+          "voidReason": null,
+          "voidedAt": null
+        },
+        {
+          "code": "SL-DEMO-A2",
+          "operator": "陆川",
+          "stageIndex": 3,
+          "phase": "producing",
+          "observations": [],
+          "records": [
+            {
+              "stage": "取样",
+              "operator": "陆川",
+              "basis": "示范：取样工序依据",
+              "at": "2026-09-12T19:15:06.285Z"
+            },
+            {
+              "stage": "切割",
+              "operator": "陆川",
+              "basis": "示范：切割工序依据",
+              "at": "2026-09-12T19:15:06.285Z"
+            },
+            {
+              "stage": "研磨",
+              "operator": "陆川",
+              "basis": "示范：研磨工序依据",
+              "at": "2026-09-12T19:15:06.285Z"
+            },
+            {
+              "stage": "染色",
+              "operator": null,
+              "basis": null,
+              "at": null
+            },
+            {
+              "stage": "封片",
+              "operator": null,
+              "basis": null,
+              "at": null
+            }
+          ],
+          "idempotencyKeys": {},
+          "replacementFor": null,
+          "replacedBy": null,
+          "voided": false,
+          "voidReason": null,
+          "voidedAt": null
+        },
+        {
+          "code": "SL-DEMO-A3",
+          "operator": "周岩",
+          "stageIndex": 5,
+          "phase": "rejected",
+          "observations": [
+            {
+              "conclusion": "不合格",
+              "defect": "染色不均/边缘破碎",
+              "reason": "研磨粒度超标导致盖片不密合",
+              "operator": "周岩",
+              "basis": "镜下观察记录 OBS-0091",
+              "at": "2026-09-12T19:15:06.285Z"
+            }
+          ],
+          "records": [
+            {
+              "stage": "取样",
+              "operator": "周岩",
+              "basis": "示范：取样工序依据",
+              "at": "2026-09-12T19:15:06.285Z"
+            },
+            {
+              "stage": "切割",
+              "operator": "周岩",
+              "basis": "示范：切割工序依据",
+              "at": "2026-09-12T19:15:06.285Z"
+            },
+            {
+              "stage": "研磨",
+              "operator": "周岩",
+              "basis": "示范：研磨工序依据",
+              "at": "2026-09-12T19:15:06.285Z"
+            },
+            {
+              "stage": "染色",
+              "operator": "周岩",
+              "basis": "示范：染色工序依据",
+              "at": "2026-09-12T19:15:06.285Z"
+            },
+            {
+              "stage": "封片",
+              "operator": "周岩",
+              "basis": "示范：封片工序依据",
+              "at": "2026-09-12T19:15:06.285Z"
+            }
+          ],
+          "idempotencyKeys": {},
+          "replacementFor": null,
+          "replacedBy": "SL-DEMO-A3-R1",
+          "voided": true,
+          "voidReason": "染色不均且边缘破碎，无法判读",
+          "voidedAt": "2026-09-12T19:15:06.285Z"
+        },
+        {
+          "code": "SL-DEMO-A3-R1",
+          "operator": "韩冰",
+          "stageIndex": 1,
+          "phase": "producing",
+          "observations": [],
+          "records": [
+            {
+              "stage": "取样",
+              "operator": "韩冰",
+              "basis": "示范：取样工序依据",
+              "at": "2026-09-12T19:15:06.285Z"
+            },
+            {
+              "stage": "切割",
+              "operator": null,
+              "basis": null,
+              "at": null
+            },
+            {
+              "stage": "研磨",
+              "operator": null,
+              "basis": null,
+              "at": null
+            },
+            {
+              "stage": "染色",
+              "operator": null,
+              "basis": null,
+              "at": null
+            },
+            {
+              "stage": "封片",
+              "operator": null,
+              "basis": null,
+              "at": null
+            }
+          ],
+          "idempotencyKeys": {},
+          "replacementFor": "SL-DEMO-A3",
+          "replacedBy": null,
+          "voided": false,
+          "voidReason": null,
+          "voidedAt": null
         }
       ]
     }
